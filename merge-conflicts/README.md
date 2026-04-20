@@ -1,6 +1,7 @@
 # merge-conflicts
 
 `merge-conflicts` is a pure-Steel example plugin for the Helix Steel branch. It provides a current-buffer UI for navigating and resolving Git merge conflicts without leaving the editor.
+[See recording here](https://asciinema.org/a/WUlho6eeIP2bR1HG)!
 
 ## What it does
 
