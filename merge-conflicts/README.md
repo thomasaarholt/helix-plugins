@@ -42,6 +42,8 @@ If you are loading it directly from a checkout, use the absolute path instead ($
 - `:merge-conflicts-keep-both` - keep ours followed by theirs
 - `:merge-conflicts-strip-markers` - remove the marker lines and keep all section bodies in order (`ours`, then `base` when present, then `theirs`)
 
+The five `:merge-conflicts-keep-*` and `:merge-conflicts-strip-markers` commands operate on every conflict that overlaps the current selection. Press `%` to select the whole buffer (or extend a selection across several conflicts) and the command will apply the chosen action to all of them in one go. With no overlapping selection the action falls back to the conflict that the resolver window is currently focused on, so the modal keybindings keep their original single-conflict behavior. For `:merge-conflicts-keep-base`, conflicts without a base section are skipped and reported in the status message.
+
 
 ## Window keybindings
 

@@ -340,47 +340,143 @@
     [(equal? action 'strip) "strip"]
     [else "ours"]))
 
+(define (any-of? pred lst)
+  (cond
+    [(null? lst) #f]
+    [(pred (car lst)) #t]
+    [else (any-of? pred (cdr lst))]))
+
+(define (range-touches-conflict? r-from r-to start-char end-char)
+  (if (= r-from r-to)
+      ;; Treat a zero-width selection (cursor) as inside the conflict if it
+      ;; lies anywhere within [start, end].
+      (and (>= r-from start-char) (<= r-from end-char))
+      ;; Non-empty ranges count as overlap when they share any extent at all.
+      (and (< r-from end-char) (> r-to start-char))))
+
+(define (current-selection-ranges)
+  (let ([selection (current-selection-object)])
+    (if selection
+        (map (lambda (r) (cons (range->from r) (range->to r)))
+             (selection->ranges selection))
+        '())))
+
+(define (conflicts-overlapping-ranges conflicts ranges)
+  (if (null? ranges)
+      '()
+      (filter
+       (lambda (c)
+         (let ([cs (ConflictBlock-start-char c)]
+               [ce (ConflictBlock-end-char c)])
+           (any-of? (lambda (r) (range-touches-conflict? (car r) (cdr r) cs ce))
+                    ranges)))
+       conflicts)))
+
+(define (action-applicable? action conflict)
+  (if (equal? action 'base)
+      (ConflictBlock-has-base conflict)
+      #t))
+
+(define (target-conflicts-for-action session)
+  ;; Conflicts whose extent intersects the user's current selection take
+  ;; priority. This lets `%` (or any range selection) drive a batch apply.
+  ;; If nothing in the selection overlaps a conflict, fall back to the
+  ;; session's current conflict (preserving the original single-conflict
+  ;; behavior used by the modal window).
+  (let* ([conflicts (session-conflicts session)]
+         [matched (conflicts-overlapping-ranges conflicts (current-selection-ranges))])
+    (cond
+      [(not (null? matched)) matched]
+      [else
+       (let ([current (session-current-conflict session)])
+         (if current (list current) '()))])))
+
+(define (apply-resolution-to-conflict! action conflict)
+  (let* ([start-char (ConflictBlock-start-char conflict)]
+         [original-text (ConflictBlock-full-text conflict)]
+         [original-length (string-length original-text)]
+         [resolved-text (resolution-text conflict action)]
+         [resolved-length (string-length resolved-text)])
+    (replace-span-with! start-char original-length resolved-text)
+    (shift-merge-conflicts-history-stacks! start-char (- resolved-length original-length))
+    (record-merge-conflict-undo! start-char resolved-text original-text action)))
+
+(define (batch-apply-status-message action applied-count skipped-count remaining-count)
+  (let ([skipped-msg
+         (if (> skipped-count 0)
+             (string-append " ("
+                            (int->string skipped-count)
+                            " "
+                            (pluralize skipped-count "conflict" "conflicts")
+                            " without base skipped.)")
+             "")])
+    (cond
+      [(= remaining-count 0)
+       (string-append (action-label action)
+                      " Resolved "
+                      (int->string applied-count)
+                      " "
+                      (pluralize applied-count "conflict." "conflicts.")
+                      " All merge conflicts resolved."
+                      skipped-msg)]
+      [else
+       (string-append (action-label action)
+                      " Resolved "
+                      (int->string applied-count)
+                      " "
+                      (pluralize applied-count "conflict." "conflicts.")
+                      " "
+                      (int->string remaining-count)
+                      " "
+                      (pluralize remaining-count "conflict remains." "conflicts remain.")
+                      skipped-msg)])))
+
 (define (apply-current-resolution! action)
   (let ([session (active-session #t)])
     (if (not session)
         'no-session
-        (let ([conflict (session-current-conflict session)])
-          (cond
-            [(not conflict) 'no-session]
-            [(and (equal? action 'base) (not (ConflictBlock-has-base conflict)))
-             (set-warning! "This conflict does not include a base section.")
-             'unsupported]
-            [else
-             (when (session-preview-active? session)
-                (restore-current-preview! session))
-              (let* ([start-char (ConflictBlock-start-char conflict)]
-                     [original-text (ConflictBlock-full-text conflict)]
-                     [original-length (string-length original-text)]
-                     [resolved-text (resolution-text conflict action)]
-                     [resolved-length (string-length resolved-text)])
-                (set-current-selection-object!
-                 (range->selection
-                  (range start-char (ConflictBlock-end-char conflict))))
-                (replace-selection-with resolved-text)
-                (shift-merge-conflicts-history-stacks! start-char (- resolved-length original-length))
-                (record-merge-conflict-undo! start-char resolved-text original-text action))
-
-              (let ([updated-session (prepare-session-from-current-buffer #f)])
-                (if updated-session
-                   (begin
-                     (focus-current-conflict! updated-session)
-                     (set-status!
-                     (to-string (action-label action)
-                                 (session-conflict-count updated-session)
-                                 (pluralize (session-conflict-count updated-session)
-                                            "conflict remains."
-                                            "conflicts remain.")))
-                     'updated)
-                    (begin
-                       (hide-merge-conflicts-window!)
-                       (set-status! (to-string (action-label action) "All merge conflicts resolved."))
-                       'resolved-all)))]))))
-  )
+        (begin
+          (when (session-preview-active? session)
+            (restore-current-preview! session))
+          (let ([targets (target-conflicts-for-action session)])
+            (cond
+              [(null? targets) 'no-session]
+              [else
+               (let* ([applicable (filter (lambda (c) (action-applicable? action c)) targets)]
+                      [skipped-count (- (length targets) (length applicable))])
+                 (cond
+                   [(null? applicable)
+                    (if (equal? action 'base)
+                        (set-warning! "No conflicts in the current selection include a base section.")
+                        (set-warning! "No conflicts in the current selection support this action."))
+                    'unsupported]
+                   [else
+                    ;; Apply in reverse document order so that earlier conflicts
+                    ;; keep their original char positions while we edit later
+                    ;; ones first. `conflicts-overlapping-ranges` preserves the
+                    ;; ascending order of `session-conflicts`.
+                    (for-each (lambda (c) (apply-resolution-to-conflict! action c))
+                              (reverse applicable))
+                    (let* ([applied-count (length applicable)]
+                           [updated-session (prepare-session-from-current-buffer #f)]
+                           [remaining-count (if updated-session
+                                                (session-conflict-count updated-session)
+                                                0)])
+                      (cond
+                        [updated-session
+                         (focus-current-conflict! updated-session)
+                         (set-status! (batch-apply-status-message action
+                                                                  applied-count
+                                                                  skipped-count
+                                                                  remaining-count))
+                         'updated]
+                        [else
+                         (hide-merge-conflicts-window!)
+                         (set-status! (batch-apply-status-message action
+                                                                  applied-count
+                                                                  skipped-count
+                                                                   0))
+                         'resolved-all]))]))]))))))
 
 (define (undo-merge-conflict-change!)
   (when (and *merge-conflicts-session* (session-preview-active? *merge-conflicts-session*))
@@ -520,27 +616,34 @@
   (navigate-current-session! -1))
 
 ;;@doc
-;; Resolve the current conflict by keeping the current branch's side.
+;; Keep the current branch's side. Applies to every conflict overlapping the
+;; current selection, or to the current conflict when nothing is selected.
 (define (merge-conflicts-keep-ours)
   (apply-current-resolution! 'ours))
 
 ;;@doc
-;; Resolve the current conflict by keeping the incoming branch's side.
+;; Keep the incoming branch's side. Applies to every conflict overlapping the
+;; current selection, or to the current conflict when nothing is selected.
 (define (merge-conflicts-keep-theirs)
   (apply-current-resolution! 'theirs))
 
 ;;@doc
-;; Resolve the current conflict by keeping the base section when present.
+;; Keep the base section when present. Applies to every conflict overlapping
+;; the current selection, or to the current conflict when nothing is selected.
+;; Conflicts without a base section are skipped.
 (define (merge-conflicts-keep-base)
   (apply-current-resolution! 'base))
 
 ;;@doc
-;; Resolve the current conflict by concatenating ours followed by theirs.
+;; Concatenate ours followed by theirs. Applies to every conflict overlapping
+;; the current selection, or to the current conflict when nothing is selected.
 (define (merge-conflicts-keep-both)
   (apply-current-resolution! 'both))
 
 ;;@doc
-;; Remove conflict marker lines and keep the section bodies in order.
+;; Remove conflict marker lines and keep the section bodies in order. Applies
+;; to every conflict overlapping the current selection, or to the current
+;; conflict when nothing is selected.
 (define (merge-conflicts-strip-markers)
   (apply-current-resolution! 'strip))
 
